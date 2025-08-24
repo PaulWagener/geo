@@ -147,6 +147,155 @@ where
     }
 }
 
+// Extension trait for optimized point-in-multipolygon test
+pub trait ContainsPointFast<T: GeoFloat + rstar::RTreeNum> {
+    /// An optimized point-in-multipolygon test using an interval tree.
+    fn contains_point_fast(&self, point: &Point<T>) -> bool;
+}
+
+impl<T> ContainsPointFast<T> for MultiPolygon<T>
+where
+    T: GeoFloat + rstar::RTreeNum,
+{
+    fn contains_point_fast(&self, point: &Point<T>) -> bool {
+        // Handle empty multipolygon
+        if self.0.is_empty() {
+            return false;
+        }
+        let imp = IndexedMultiPolygon::new(self);
+        imp.contains_point(point.0)
+    }
+}
+
+use crate::intersects::value_in_between;
+use crate::kernels::{Kernel, Orientation};
+use crate::{Coord, LineString, MultiPolygon, Polygon};
+use rstar::{RTree, AABB};
+
+struct YIntervalSegment<F: GeoFloat> {
+    y_min: F,
+    y_max: F,
+    segment: (Coord<F>, Coord<F>),
+    is_exterior: bool,
+}
+
+impl<F: GeoFloat + rstar::RTreeNum> rstar::RTreeObject for YIntervalSegment<F> {
+    type Envelope = AABB<[F; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        // Use 2D AABB with x-extent covering the segment's x-range
+        let x_min = self.segment.0.x.min(self.segment.1.x);
+        let x_max = self.segment.0.x.max(self.segment.1.x);
+        AABB::from_corners([x_min, self.y_min], [x_max, self.y_max])
+    }
+}
+
+pub struct IndexedMultiPolygon<F: GeoFloat + rstar::RTreeNum> {
+    y_interval_tree: RTree<YIntervalSegment<F>>,
+    geometry: MultiPolygon<F>,
+}
+
+impl<F: GeoFloat + rstar::RTreeNum> IndexedMultiPolygon<F> {
+    pub fn new(mp: &MultiPolygon<F>) -> Self {
+        let mp = mp.clone();
+        let mut segments = Vec::new();
+
+        for polygon in &mp.0 {
+            Self::add_ring_segments(&mut segments, polygon.exterior(), true);
+            for interior in polygon.interiors() {
+                Self::add_ring_segments(&mut segments, interior, false);
+            }
+        }
+
+        // RTree requires at least one element for 1D trees, so handle empty case
+        let y_interval_tree = if segments.is_empty() {
+            RTree::new()
+        } else {
+            RTree::bulk_load(segments)
+        };
+
+        Self {
+            y_interval_tree,
+            geometry: mp,
+        }
+    }
+
+    fn add_ring_segments(
+        segments: &mut Vec<YIntervalSegment<F>>,
+        ring: &LineString<F>,
+        is_exterior: bool,
+    ) {
+        for window in ring.coords().collect::<Vec<_>>().windows(2) {
+            let (p1, p2) = (window[0], window[1]);
+            segments.push(YIntervalSegment {
+                y_min: p1.y.min(p2.y),
+                y_max: p1.y.max(p2.y),
+                segment: (*p1, *p2),
+                is_exterior,
+            });
+        }
+    }
+
+    pub fn contains_point(&self, point: Coord<F>) -> bool {
+        // Query the R-tree for segments whose bounding box intersects with a horizontal ray
+        // from the point extending to the right.
+        // We use a degenerate AABB (a horizontal line segment) for the query.
+        let query_envelope = AABB::from_corners(
+            [point.x, point.y],
+            [F::infinity(), point.y], // Same y-coordinate creates a horizontal line
+        );
+
+        let candidates = self
+            .y_interval_tree
+            .locate_in_envelope_intersecting(&query_envelope)
+            .filter(|seg| {
+                // Additional filtering: segment must extend to the right of the point
+                seg.segment.0.x.max(seg.segment.1.x) > point.x
+            });
+
+        // Use winding number algorithm with robust predicates
+        // Based on coord_pos_relative_to_ring in coordinate_position.rs
+        let mut winding_number = 0;
+        for segment in candidates {
+            let seg = segment.segment;
+
+            // Apply winding number algorithm using robust predicates
+            let mut contribution = 0;
+            if seg.0.y <= point.y {
+                if seg.1.y >= point.y {
+                    let o = F::Ker::orient2d(seg.0, seg.1, point);
+                    if o == Orientation::CounterClockwise && seg.1.y != point.y {
+                        contribution = 1;
+                    } else if o == Orientation::Collinear
+                        && value_in_between(point.x, seg.0.x, seg.1.x)
+                    {
+                        // Point on boundary!
+                        return false;
+                    }
+                }
+            } else if seg.1.y <= point.y {
+                let o = F::Ker::orient2d(seg.0, seg.1, point);
+                if o == Orientation::Clockwise {
+                    contribution = -1;
+                } else if o == Orientation::Collinear && value_in_between(point.x, seg.0.x, seg.1.x)
+                {
+                    // Point on boundary!
+                    return false;
+                }
+            }
+
+            // Exterior rings contribute positively, interior rings (holes) contribute negatively
+            if segment.is_exterior {
+                winding_number += contribution;
+            } else {
+                winding_number -= contribution;
+            }
+        }
+
+        winding_number != 0
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

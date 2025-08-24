@@ -130,3 +130,7 @@ harness = false
 [[bench]]
 name = "sweep_line_intersection"
 harness = false
+
+[[bench]]
+name = "fast_coordinate_position"
+harness = false
