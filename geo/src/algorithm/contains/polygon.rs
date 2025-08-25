@@ -177,13 +177,10 @@ struct YIntervalSegment<F: GeoFloat> {
 }
 
 impl<F: GeoFloat + rstar::RTreeNum> rstar::RTreeObject for YIntervalSegment<F> {
-    type Envelope = AABB<[F; 2]>;
+    type Envelope = AABB<[F; 1]>;
 
     fn envelope(&self) -> Self::Envelope {
-        // Use 2D AABB with x-extent covering the segment's x-range
-        let x_min = self.segment.0.x.min(self.segment.1.x);
-        let x_max = self.segment.0.x.max(self.segment.1.x);
-        AABB::from_corners([x_min, self.y_min], [x_max, self.y_max])
+        AABB::from_corners([self.y_min], [self.y_max])
     }
 }
 
@@ -232,10 +229,7 @@ impl<F: GeoFloat + rstar::RTreeNum> IndexedMultiPolygon<F> {
         // Query the R-tree for segments whose bounding box intersects with a horizontal ray
         // from the point extending to the right.
         // We use a degenerate AABB (a horizontal line segment) for the query.
-        let query_envelope = AABB::from_corners(
-            [point.x, point.y],
-            [F::infinity(), point.y], // Same y-coordinate creates a horizontal line
-        );
+        let query_envelope = AABB::from_point([point.y]);
 
         let candidates = self
             .y_interval_tree
