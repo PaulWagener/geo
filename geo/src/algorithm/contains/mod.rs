@@ -45,6 +45,8 @@ mod polygon;
 mod rect;
 mod triangle;
 
+pub use polygon::IndexedMultiPolygon;
+
 macro_rules! impl_contains_from_relate {
     ($for:ty,  [$($target:ty),*]) => {
         $(
