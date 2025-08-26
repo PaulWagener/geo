@@ -44,7 +44,6 @@ mod point;
 mod polygon;
 mod rect;
 mod triangle;
-
 pub use polygon::IndexedMultiPolygon;
 
 macro_rules! impl_contains_from_relate {
@@ -95,7 +94,9 @@ pub(crate) use impl_contains_geometry_for;
 
 #[cfg(test)]
 mod test {
+    use crate::contains::polygon::IndexedMultiPolygon;
     use crate::line_string;
+    use crate::BoundingRect;
     use crate::Contains;
     use crate::Relate;
     use crate::{coord, Coord, Line, LineString, MultiPolygon, Point, Polygon, Rect, Triangle};
@@ -323,6 +324,36 @@ mod test {
         use crate::algorithm::contains::polygon::ContainsPointFast;
         let multipoly = MultiPolygon::<f64>::new(Vec::new());
         assert!(!multipoly.contains_point_fast(&Point::new(2., 1.)));
+    }
+
+    // See https://github.com/georust/geo/issues/1184#issuecomment-3221772752
+    #[test]
+    fn contains_point_fast_bug() {
+        let zones: MultiPolygon<f64> = geo_test_fixtures::nl_zones();
+        let bound = zones.bounding_rect().unwrap();
+        let mut coords = vec![];
+
+        // Generate a bunch of points inside the zone bounds
+        let size = 20;
+        let mut x = bound.min().x;
+        for _ in 0..=size {
+            let mut y = bound.min().y;
+            for _ in 0..=size {
+                coords.push(Coord { x, y });
+                y += bound.height() / size as f64;
+            }
+
+            x += bound.width() / size as f64;
+        }
+
+        let indexed = IndexedMultiPolygon::new(&zones);
+        let mut inside = 0;
+        for c in &coords {
+            if indexed.contains_point(*c) {
+                inside += 1;
+            }
+        }
+        assert_eq!(inside, 45);
     }
 
     #[test]

@@ -167,6 +167,8 @@ where
     }
 }
 
+use crate::intersects::value_in_between;
+use crate::kernels::{Kernel, Orientation};
 use crate::{Coord, LineString, MultiPolygon, Polygon};
 use rstar::{RTree, AABB};
 
@@ -174,6 +176,7 @@ struct YIntervalSegment<F: GeoFloat> {
     y_min: F,
     y_max: F,
     segment: (Coord<F>, Coord<F>),
+    is_exterior: bool,
 }
 
 impl<F: GeoFloat + rstar::RTreeNum> rstar::RTreeObject for YIntervalSegment<F> {
@@ -198,9 +201,9 @@ impl<F: GeoFloat + rstar::RTreeNum> IndexedMultiPolygon<F> {
         let mut segments = Vec::new();
 
         for polygon in &mp.0 {
-            Self::add_ring_segments(&mut segments, polygon.exterior());
+            Self::add_ring_segments(&mut segments, polygon.exterior(), true);
             for interior in polygon.interiors() {
-                Self::add_ring_segments(&mut segments, interior);
+                Self::add_ring_segments(&mut segments, interior, false);
             }
         }
 
@@ -217,13 +220,18 @@ impl<F: GeoFloat + rstar::RTreeNum> IndexedMultiPolygon<F> {
         }
     }
 
-    fn add_ring_segments(segments: &mut Vec<YIntervalSegment<F>>, ring: &LineString<F>) {
+    fn add_ring_segments(
+        segments: &mut Vec<YIntervalSegment<F>>,
+        ring: &LineString<F>,
+        is_exterior: bool,
+    ) {
         for window in ring.coords().collect::<Vec<_>>().windows(2) {
             let (p1, p2) = (window[0], window[1]);
             segments.push(YIntervalSegment {
                 y_min: p1.y.min(p2.y),
                 y_max: p1.y.max(p2.y),
                 segment: (*p1, *p2),
+                is_exterior,
             });
         }
     }
@@ -241,49 +249,50 @@ impl<F: GeoFloat + rstar::RTreeNum> IndexedMultiPolygon<F> {
             .y_interval_tree
             .locate_in_envelope_intersecting(&query_envelope)
             .filter(|seg| {
-                // Additional filtering: segment must actually cross the y-coordinate
-                // and extend to the right of the point
+                // Additional filtering: segment must extend to the right of the point
                 seg.segment.0.x.max(seg.segment.1.x) > point.x
             });
 
-        let mut crossings = 0;
+        // Use winding number algorithm with robust predicates
+        // Based on coord_pos_relative_to_ring in coordinate_position.rs
+        let mut winding_number = 0;
         for segment in candidates {
-            if self.ray_intersects_segment(point, segment.segment) {
-                crossings += 1;
+            let seg = segment.segment;
+
+            // Apply winding number algorithm using robust predicates
+            let mut contribution = 0;
+            if seg.0.y <= point.y {
+                if seg.1.y >= point.y {
+                    let o = F::Ker::orient2d(seg.0, seg.1, point);
+                    if o == Orientation::CounterClockwise && seg.1.y != point.y {
+                        contribution = 1;
+                    } else if o == Orientation::Collinear
+                        && value_in_between(point.x, seg.0.x, seg.1.x)
+                    {
+                        // Point on boundary!
+                        return false;
+                    }
+                }
+            } else if seg.1.y <= point.y {
+                let o = F::Ker::orient2d(seg.0, seg.1, point);
+                if o == Orientation::Clockwise {
+                    contribution = -1;
+                } else if o == Orientation::Collinear && value_in_between(point.x, seg.0.x, seg.1.x)
+                {
+                    // Point on boundary!
+                    return false;
+                }
+            }
+
+            // Exterior rings contribute positively, interior rings (holes) contribute negatively
+            if segment.is_exterior {
+                winding_number += contribution;
+            } else {
+                winding_number -= contribution;
             }
         }
 
-        crossings % 2 == 1
-    }
-
-    fn ray_intersects_segment(&self, point: Coord<F>, seg: (Coord<F>, Coord<F>)) -> bool {
-        let (p1, p2) = seg;
-
-        // Skip horizontal segments
-        if (p1.y - p2.y).abs() < F::epsilon() {
-            return false;
-        }
-
-        let y_min = p1.y.min(p2.y);
-        let y_max = p1.y.max(p2.y);
-
-        if point.y < y_min || point.y > y_max {
-            return false;
-        }
-
-        // Handle endpoint intersections
-        if (point.y - y_min).abs() < F::epsilon() {
-            return p1.y < p2.y;
-        }
-        if (point.y - y_max).abs() < F::epsilon() {
-            return p2.y < p1.y;
-        }
-
-        // Calculate intersection X coordinate
-        let t = (point.y - p1.y) / (p2.y - p1.y);
-        let intersection_x = p1.x + t * (p2.x - p1.x);
-
-        intersection_x > point.x
+        winding_number != 0
     }
 }
 

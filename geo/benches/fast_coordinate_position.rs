@@ -39,7 +39,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 }
             }
 
-            //assert_eq!(inside, 45); // IndexedMultipolygon gives wrong result
+            assert_eq!(inside, 45);
         });
     });
 
